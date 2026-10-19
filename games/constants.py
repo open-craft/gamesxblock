@@ -23,6 +23,15 @@ class DEFAULT:
     GAME_TYPE = GAME_TYPE.FLASHCARDS
     IS_SHUFFLED = True
     HAS_TIMER = True
+    DECK_NAME = "Deck 1"
+
+
+class DECK_FIELD:
+    """Deck field names."""
+
+    DECK_KEY = "deck_key"
+    NAME = "name"
+    CARDS = "cards"
 
 
 class CARD_FIELD:

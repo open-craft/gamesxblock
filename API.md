@@ -18,8 +18,9 @@ The Games XBlock uses the following fields to store configuration and state:
 
 ### Content-Scoped Fields
 - **`title`** (string): The title displayed in the XBlock. Default varies by game type.
-- **`cards`** (list): List of card objects containing terms and definitions.
-- **`list_length`** (integer): Number of cards in the list (for convenience).
+- **`decks`** (list): Ordered list of deck objects, authored for Flashcards. A legacy `cards`-only block appears as one deck named `Deck 1`. Matching consumes the `cards`/Deck 1 mirror; any additional stored decks are preserved but unused by Matching. Decks are stored in XBlock fields, so ordinary OLX serialization preserves them; there is no separate import/export module.
+- **`cards`** (list): Persisted mirror of Deck 1. Older clients continue to read and write this field.
+- **`list_length`** (integer): Stored count of the cards in the `cards` mirror.
 
 ### Settings-Scoped Fields
 - **`display_name`** (string): Display name for the XBlock. Default: `"Games XBlock"`.
@@ -39,7 +40,7 @@ These APIs work across both flashcards and matching game types.
 ### `get_settings`
 
 **Type**: JSON Handler
-**Description**: Retrieves current game configuration including game type, cards, shuffle setting, and timer setting.
+**Description**: Retrieves the current game configuration, including decks, the Deck 1 cards mirror, shuffle setting, and timer setting.
 
 **Request**:
 ```json
@@ -49,7 +50,23 @@ These APIs work across both flashcards and matching game types.
 **Response**:
 ```json
 {
-  "game_type": "matching",
+  "game_type": "flashcards",
+  "decks": [
+    {
+      "deck_key": "9f1c2f7e-6a4b-4f3c-8f1e-2b7d5c9a0e11",
+      "name": "Deck 1",
+      "cards": [
+        {
+          "term": "Python",
+          "term_image": "http://example.com/python.png",
+          "definition": "A high-level programming language",
+          "definition_image": "",
+          "order": 0,
+          "card_key": "550e8400-e29b-41d4-a716-446655440000"
+        }
+      ]
+    }
+  ],
   "cards": [
     {
       "term": "Python",
@@ -67,7 +84,8 @@ These APIs work across both flashcards and matching game types.
 
 **Fields**:
 - `game_type` (string): Current game type (`"flashcards"` or `"matching"`)
-- `cards` (array): List of card objects (see [Card Object](#card-object))
+- `decks` (array): Ordered list of deck objects (see [Deck Object](#deck-object)). Always present; a legacy `cards`-only block appears as one deck named `Deck 1`. Matching consumes the Deck 1 mirror and preserves any additional stored decks.
+- `cards` (array): Persisted Deck 1 mirror (see [Card Object](#card-object)). Kept for older clients.
 - `is_shuffled` (boolean): Shuffle setting
 - `has_timer` (boolean): Timer setting
 
@@ -76,7 +94,7 @@ These APIs work across both flashcards and matching game types.
 ### `save_settings`
 
 **Type**: JSON Handler
-**Description**: Saves game type, shuffle setting, timer setting, and all cards in one API call. Validates card format and generates unique identifiers.
+**Description**: Saves game type, shuffle/timer settings, and decks in one call. `decks` is the source of truth only when it is sent; a payload without `decks` updates Deck 1 from `cards`. Either way the stored `cards` mirror is rebuilt from Deck 1.
 
 **Request**:
 ```json
@@ -85,18 +103,30 @@ These APIs work across both flashcards and matching game types.
   "is_shuffled": true,
   "has_timer": false,
   "display_name": "My Vocabulary Game",
-  "cards": [
+  "decks": [
     {
-      "term": "Algorithm",
-      "term_image": "",
-      "definition": "A step-by-step procedure for solving a problem",
-      "definition_image": "http://example.com/algo.png"
+      "deck_key": "9f1c2f7e-6a4b-4f3c-8f1e-2b7d5c9a0e11",
+      "name": "Deck 1",
+      "cards": [
+        {
+          "term": "Algorithm",
+          "term_image": "",
+          "definition": "A step-by-step procedure for solving a problem",
+          "definition_image": "http://example.com/algo.png"
+        }
+      ]
     },
     {
-      "term": "Data Structure",
-      "term_image": "http://example.com/ds.png",
-      "definition": "A way of organizing data efficiently",
-      "definition_image": ""
+      "deck_key": "3b6d8e2a-1c4f-4a7d-9e0b-5f2c8d6a1b33",
+      "name": "Deck 2",
+      "cards": [
+        {
+          "term": "Data Structure",
+          "term_image": "http://example.com/ds.png",
+          "definition": "A way of organizing data efficiently",
+          "definition_image": ""
+        }
+      ]
     }
   ]
 }
@@ -107,6 +137,36 @@ These APIs work across both flashcards and matching game types.
 {
   "success": true,
   "game_type": "flashcards",
+  "decks": [
+    {
+      "deck_key": "9f1c2f7e-6a4b-4f3c-8f1e-2b7d5c9a0e11",
+      "name": "Deck 1",
+      "cards": [
+        {
+          "term": "Algorithm",
+          "term_image": "",
+          "definition": "A step-by-step procedure for solving a problem",
+          "definition_image": "http://example.com/algo.png",
+          "order": 0,
+          "card_key": "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        }
+      ]
+    },
+    {
+      "deck_key": "3b6d8e2a-1c4f-4a7d-9e0b-5f2c8d6a1b33",
+      "name": "Deck 2",
+      "cards": [
+        {
+          "term": "Data Structure",
+          "term_image": "http://example.com/ds.png",
+          "definition": "A way of organizing data efficiently",
+          "definition_image": "",
+          "order": 0,
+          "card_key": "3f847e5d-8a6b-4c3e-9d2a-1b8f7c4e0d9a"
+        }
+      ]
+    }
+  ],
   "cards": [
     {
       "term": "Algorithm",
@@ -115,17 +175,9 @@ These APIs work across both flashcards and matching game types.
       "definition_image": "http://example.com/algo.png",
       "order": 0,
       "card_key": "7c9e6679-7425-40de-944b-e07fc1f90ae7"
-    },
-    {
-      "term": "Data Structure",
-      "term_image": "http://example.com/ds.png",
-      "definition": "A way of organizing data efficiently",
-      "definition_image": "",
-      "order": 1,
-      "card_key": "3f847e5d-8a6b-4c3e-9d2a-1b8f7c4e0d9a"
     }
   ],
-  "count": 2,
+  "count": 1,
   "is_shuffled": true,
   "has_timer": false
 }
@@ -140,10 +192,34 @@ These APIs work across both flashcards and matching game types.
 ```
 
 **Validation Rules**:
-- Each card must be an object/dictionary
-- Each card must contain both `term` and `definition` fields
-- Missing `card_key` will be auto-generated as UUID
-- Missing image URLs default to empty strings
+- `decks` must be an ordered list with at least one deck; an empty `decks` list is rejected.
+- Each deck must be an object with a non-empty `name` and a `cards` list. Every submitted deck must include `cards`; `"cards": []` is the valid empty deck.
+- Deck names are trimmed before saving and must be unique ignoring case.
+- Missing `deck_key` and `card_key` values are assigned on save; existing keys are preserved.
+- A card belongs to exactly one deck. Its `card_key` is preserved when it moves between decks.
+- Each card must be an object containing both `term` and `definition` fields.
+- Empty decks are allowed.
+- Invalid deck or card data rejects the whole save; stored content is unchanged.
+- `cards` always mirrors Deck 1 after a save (rebuilt from Deck 1 on every save). If both `decks` and `cards` are present, `decks` wins.
+- A `cards`-only payload updates Deck 1 and leaves every other deck's cards, keys, and order unchanged.
+- `list_length` is stored and tracks only the `cards` mirror.
+- The response `count` is the number of cards in the `cards` mirror.
+
+**Legacy cards-only saves**:
+
+```json
+{
+  "game_type": "flashcards",
+  "cards": [
+    {
+      "term": "Algorithm",
+      "definition": "A step-by-step procedure for solving a problem"
+    }
+  ]
+}
+```
+
+A payload without `decks` updates Deck 1 only. Every other deck keeps its cards, keys, and order.
 
 ---
 
@@ -435,6 +511,33 @@ These APIs work across both flashcards and matching game types.
 
 ## Data Structures
 
+### Deck Object
+
+Represents one named deck in a Flashcards block.
+
+```json
+{
+  "deck_key": "9f1c2f7e-6a4b-4f3c-8f1e-2b7d5c9a0e11",
+  "name": "Deck 1",
+  "cards": [
+    {
+      "term": "Algorithm",
+      "definition": "A step-by-step procedure for solving a problem",
+      "card_key": "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+    }
+  ]
+}
+```
+
+**Fields**:
+- **`deck_key`** (string, optional): Stable deck identifier. Assigned on save when missing.
+- **`name`** (string, required): Deck name. Trimmed on save and unique ignoring case.
+- **`cards`** (array, required): Ordered list of card objects (see [Card Object](#card-object)). Every submitted deck must include `cards`; `[]` is the valid empty deck.
+
+Decks are ordered; the list order is the creation order. Deck authoring applies to Flashcards only. Matching consumes the Deck 1 mirror; any additional stored decks are preserved but unused by Matching.
+
+---
+
 ### Card Object
 
 Represents a single term-definition pair in the game.
@@ -456,7 +559,7 @@ Represents a single term-definition pair in the game.
 - **`definition`** (string, required): The definition/answer/back side text
 - **`definition_image`** (string, optional): URL to image for the definition
 - **`order`** (integer, optional): Display order (auto-generated if missing)
-- **`card_key`** (string, optional): Unique identifier (auto-generated as UUID if missing)
+- **`card_key`** (string, optional): Stable card identifier, preserved when the card moves between decks (auto-generated as UUID if missing)
 
 ---
 
@@ -536,7 +639,7 @@ Common error scenarios:
 - Makes it harder to reverse-engineer game logic
 
 ### Validation
-- Server-side validation of card structure
+- Server-side validation of deck and card structure; invalid saves are rejected atomically
 - File extension whitelist for uploads
 - MD5 hashing prevents duplicate uploads
 - Storage key validation before deletion
@@ -566,17 +669,24 @@ response = xblock.save_settings({
     "is_shuffled": true,
     "has_timer": false,
     "display_name": "Spanish Vocabulary",
-    "cards": [
+    "decks": [
         {
-            "term": "Hola",
-            "definition": "Hello"
+            "name": "Deck 1",
+            "cards": [
+                {"term": "Hola", "definition": "Hello"},
+                {"term": "Adiós", "definition": "Goodbye"}
+            ]
         },
         {
-            "term": "Adiós",
-            "definition": "Goodbye"
+            "name": "Deck 2",
+            "cards": [
+                {"term": "Gracias", "definition": "Thank you"}
+            ]
         }
     ]
 })
+
+# `cards` is rebuilt as the Deck 1 mirror.
 
 # 2. Upload images for cards (if needed)
 # POST to upload_image handler with multipart/form-data

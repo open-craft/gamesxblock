@@ -42,6 +42,11 @@ class GamesXBlock(XBlock):
         default=[], scope=Scope.content, help=_("The list of terms and definitions.")
     )
 
+    decks = List(
+        default=[], scope=Scope.content,
+        help=_("The ordered decks; each deck has a key, a name and its own cards."),
+    )
+
     list_length = Integer(
         default=len(cards.default),
         scope=Scope.content,
