@@ -18,18 +18,24 @@ The Games XBlock uses the following fields to store configuration and state:
 
 ### Content-Scoped Fields
 - **`title`** (string): The title displayed in the XBlock. Default varies by game type.
-- **`decks`** (list): Ordered list of deck objects, authored for Flashcards. A legacy `cards`-only block appears as one deck named `Deck 1`. Matching consumes the `cards`/Deck 1 mirror; any additional stored decks are preserved but unused by Matching. Decks are stored in XBlock fields, so ordinary OLX serialization preserves them; there is no separate import/export module.
-- **`cards`** (list): Persisted mirror of Deck 1. Older clients continue to read and write this field.
-- **`list_length`** (integer): Stored count of the cards in the `cards` mirror.
+- **`decks`** (list): Ordered list of deck objects. The **first deck is the primary deck**: it is the deck older clients call `cards` and the deck learners render today. A block authored before decks existed has no stored `decks` and is presented as one deck named `Deck 1` without being rewritten. Decks are stored in XBlock fields, so ordinary OLX serialization preserves them; there is no separate import/export module.
+- **`cards`** (list): Compatibility view of the primary deck, kept in step by `save_settings` (`cards == decks[0].cards`, `list_length == len(cards)`). It is derived, never a second source of truth. Older clients keep reading and writing this field.
+- **`list_length`** (integer): Stored count of the cards in the primary deck, tracked through the `cards` mirror.
 
 ### Settings-Scoped Fields
-- **`display_name`** (string): Display name for the XBlock. Default: `"Games XBlock"`.
-- **`game_type`** (string): Type of game - either `"flashcards"` or `"matching"`. Default: `"matching"`.
+- **`display_name`** (string): Display name for the XBlock. Default: `"Games"`.
+- **`game_type`** (string): Type of game - either `"flashcards"` or `"matching"`. Default: `"flashcards"`.
 - **`is_shuffled`** (boolean): Whether cards should be shuffled. Default: `true`.
 - **`has_timer`** (boolean): Whether the game should display a timer. Default: `true`.
 
 ### User State Fields
-- **`best_time`** (integer): Best completion time in seconds for matching game (user-specific).
+- **`best_time`** (integer): Best completion time in seconds for matching game (user-specific). This is the only user state field.
+
+### Study progress is not stored by the XBlock
+Learner study progress (selected deck, Got it/Missed it queue, completion, reset) is owned by the browser `localStorage` and keyed per learner, block and deck. It is **not** accepted by `get_settings` or `save_settings`, not stored in any XBlock field or `user_state`, not graded, and not synced across devices or browsers. These handlers carry authored configuration only; adding progress fields or handlers here is out of contract.
+
+### OLX compatibility
+A block with stored decks exports `decks` and the `cards` mirror together, and an import restores both; a legacy cards-only block exports only `cards`. A block exported with multiple decks and imported into a deployment running an older Games XBlock loses the `decks` attribute (the older code ignores the unknown attribute with a `does not contain field decks` warning) while the `cards` mirror still loads the primary deck, so the content degrades to one deck instead of failing. That is why `cards` must always stay in step with the primary deck.
 
 ---
 
@@ -40,7 +46,7 @@ These APIs work across both flashcards and matching game types.
 ### `get_settings`
 
 **Type**: JSON Handler
-**Description**: Retrieves the current game configuration, including decks, the Deck 1 cards mirror, shuffle setting, and timer setting.
+**Description**: Retrieves authored configuration only: game type, decks, the primary deck's cards, shuffle setting, and timer setting. No learner study progress is returned.
 
 **Request**:
 ```json
@@ -84,8 +90,8 @@ These APIs work across both flashcards and matching game types.
 
 **Fields**:
 - `game_type` (string): Current game type (`"flashcards"` or `"matching"`)
-- `decks` (array): Ordered list of deck objects (see [Deck Object](#deck-object)). Always present; a legacy `cards`-only block appears as one deck named `Deck 1`. Matching consumes the Deck 1 mirror and preserves any additional stored decks.
-- `cards` (array): Persisted Deck 1 mirror (see [Card Object](#card-object)). Kept for older clients.
+- `decks` (array): Ordered list of deck objects (see [Deck Object](#deck-object)). Always present and never empty; a legacy `cards`-only block appears as one deck named `Deck 1`. The first entry is the primary deck.
+- `cards` (array): Compatibility view of the primary deck, identical to `decks[0].cards` (see [Card Object](#card-object)). Read it when you only understand the older single-deck shape; it is derived, never independently authoritative.
 - `is_shuffled` (boolean): Shuffle setting
 - `has_timer` (boolean): Timer setting
 
@@ -94,7 +100,7 @@ These APIs work across both flashcards and matching game types.
 ### `save_settings`
 
 **Type**: JSON Handler
-**Description**: Saves game type, shuffle/timer settings, and decks in one call. `decks` is the source of truth only when it is sent; a payload without `decks` updates Deck 1 from `cards`. Either way the stored `cards` mirror is rebuilt from Deck 1.
+**Description**: Saves game type, settings, and authored content in one call. It is a PATCH for top-level fields: a field left out of the payload keeps its current value. Authored content is replaced only when `decks` or `cards` is sent, and `decks` wins if both are. Study progress is never accepted here (see [Study progress is not stored by the XBlock](#study-progress-is-not-stored-by-the-xblock)).
 
 **Request**:
 ```json
@@ -192,6 +198,10 @@ These APIs work across both flashcards and matching game types.
 ```
 
 **Validation Rules**:
+- Omitted `game_type`, `is_shuffled`, `has_timer` and `display_name` keep their current values. A `null` or non-string `display_name` also keeps the current name; it never resets the block title.
+- Sending `game_type` rewrites the internal `title` to that type's default (`Flashcards` or `Matching`), even when the type is unchanged; omitting `game_type` leaves `title` alone.
+- A corrupt stored value cannot be repaired by omission: if the stored `game_type` is not a valid type, or a stored `is_shuffled`/`has_timer` is not a boolean, the save is rejected until the caller sends a valid replacement.
+- An explicit invalid `game_type`, or an explicit `is_shuffled`/`has_timer` that is not a boolean, rejects the save and writes nothing.
 - `decks` must be an ordered list with at least one deck; an empty `decks` list is rejected.
 - Each deck must be an object with a non-empty `name` and a `cards` list. Every submitted deck must include `cards`; `"cards": []` is the valid empty deck.
 - Deck names are trimmed before saving and must be unique ignoring case.
@@ -199,11 +209,14 @@ These APIs work across both flashcards and matching game types.
 - A card belongs to exactly one deck. Its `card_key` is preserved when it moves between decks.
 - Each card must be an object containing both `term` and `definition` fields.
 - Empty decks are allowed.
+- Deck and card shapes are closed: only the fields listed in [Deck Object](#deck-object) and [Card Object](#card-object) are stored, and unknown keys are dropped.
+- Array position is authoritative: whenever deck or card content is written, `order` is set to the card's zero-based index inside its deck.
 - Invalid deck or card data rejects the whole save; stored content is unchanged.
-- `cards` always mirrors Deck 1 after a save (rebuilt from Deck 1 on every save). If both `decks` and `cards` are present, `decks` wins.
-- A `cards`-only payload updates Deck 1 and leaves every other deck's cards, keys, and order unchanged.
-- `list_length` is stored and tracks only the `cards` mirror.
-- The response `count` is the number of cards in the `cards` mirror.
+- A `decks` payload is the complete list: it replaces every stored deck, so decks left out of the payload are deleted with their cards.
+- A `cards`-only payload updates the primary deck and preserves every other deck's cards, keys and names; each preserved deck is validated and canonicalized before the save, so its `order` values are renumbered to their array indexes. A preserved deck that is itself invalid (missing `cards`, a blank or duplicate name, a duplicate key) rejects the whole save and writes nothing.
+- A payload with neither `decks` nor `cards` leaves authored content alone; a block that already has stored decks still gets its `cards`/`list_length` mirror resynced to the primary deck.
+- `cards` always mirrors the primary deck after a save, and `list_length` equals its card count.
+- The response `count` is the number of cards in the primary deck (the `cards` mirror), not the total across decks.
 
 **Legacy cards-only saves**:
 
@@ -219,7 +232,9 @@ These APIs work across both flashcards and matching game types.
 }
 ```
 
-A payload without `decks` updates Deck 1 only. Every other deck keeps its cards, keys, and order.
+A payload without `decks` updates the primary deck only. Every other deck keeps its identity, its cards and their array positions; its card fields and `order` values are canonicalized.
+
+**Compatibility recommendation**: clients that understand decks should read and write `decks` and treat `cards` as a read-only mirror. Clients that only understand the older shape must keep sending `cards`: that save updates the primary deck and leaves the other decks alone, so multi-deck content survives old-client saves. Never treat `cards` and `decks` as two independent sources of truth.
 
 ---
 
@@ -534,7 +549,7 @@ Represents one named deck in a Flashcards block.
 - **`name`** (string, required): Deck name. Trimmed on save and unique ignoring case.
 - **`cards`** (array, required): Ordered list of card objects (see [Card Object](#card-object)). Every submitted deck must include `cards`; `[]` is the valid empty deck.
 
-Decks are ordered; the list order is the creation order. Deck authoring applies to Flashcards only. Matching consumes the Deck 1 mirror; any additional stored decks are preserved but unused by Matching.
+Decks are ordered; array position is authoritative and is the order editors and learners see. The first deck is the primary deck: `get_settings.cards` and the learner views use it, and the `cards` field mirrors it. Deck authoring applies to Flashcards only; Matching preserves stored decks but does not use them. Every deck is validated on save and any invalid deck rejects the whole save.
 
 ---
 
@@ -558,7 +573,7 @@ Represents a single term-definition pair in the game.
 - **`term_image`** (string, optional): URL to image for the term
 - **`definition`** (string, required): The definition/answer/back side text
 - **`definition_image`** (string, optional): URL to image for the definition
-- **`order`** (integer, optional): Display order (auto-generated if missing)
+- **`order`** (integer): Display position. Always set on save to the card's zero-based index in its deck; a value sent by the client is ignored because array order is authoritative.
 - **`card_key`** (string, optional): Stable card identifier, preserved when the card moves between decks (auto-generated as UUID if missing)
 
 ---
@@ -607,7 +622,7 @@ Represents one page of matches in a multi-page matching game.
 
 ## Error Handling
 
-All JSON handlers return a consistent error format:
+All JSON handlers report validation failures with **HTTP 200** and `"success": false`; they are not HTTP 4xx responses. Treat `success` as the result flag and `error` as the message to show. A rejected save writes nothing, so the stored block is unchanged.
 
 ```json
 {

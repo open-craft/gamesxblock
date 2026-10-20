@@ -59,6 +59,20 @@ class TestMatchingHandlers(TestCase):
         self.assertIn('2', frag.content)
 
     @patch('games.handlers.matching.read_resource')
+    def test_student_view_reads_the_primary_deck_over_a_stale_cards_mirror(self, mock_read_resource):
+        """Learners and Studio must agree when decks and cards storage drift."""
+        mock_read_resource.return_value = '<div>{{ list_length }}</div>'
+        self.xblock.decks = [{'deck_key': 'deck-1-key', 'name': 'Deck 1', 'cards': [
+            {CARD_FIELD.CARD_KEY: 'k1', CARD_FIELD.TERM: 'a', CARD_FIELD.DEFINITION: 'b'},
+            {CARD_FIELD.CARD_KEY: 'k2', CARD_FIELD.TERM: 'c', CARD_FIELD.DEFINITION: 'd'},
+        ]}]
+        self.xblock.cards = []
+
+        frag = MatchingHandlers.student_view(self.xblock)
+
+        self.assertIn('2', frag.content)
+
+    @patch('games.handlers.matching.read_resource')
     def test_student_view_with_multiple_pages(self, mock_read_resource):
         """Test student view with multiple pages of cards."""
         mock_read_resource.return_value = '<div>{{ total_pages }}</div>'

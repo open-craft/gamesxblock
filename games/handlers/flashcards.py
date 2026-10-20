@@ -23,7 +23,9 @@ class FlashcardsHandlers:
         """
         The student view for flashcards game.
         """
-        cards = list(xblock.cards) if xblock.cards else []
+        # Same primary-deck derivation as get_settings, so Studio and learners
+        # never disagree when the cards mirror drifts from the decks.
+        cards = CommonHandlers.primary_cards(CommonHandlers.get_decks(xblock))
         list_length = len(cards)
 
         if xblock.is_shuffled and cards:

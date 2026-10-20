@@ -340,3 +340,18 @@ class TestGamesXBlockOlxRoundTrip:
         assert imported.decks[0]['deck_key'] == shown_key
         assert imported.decks[0]['name'] == 'Deck 1'
         assert imported.decks[0]['cards'] == imported.cards
+
+    def test_primary_deck_wins_over_a_stale_cards_mirror(self):
+        """A block whose cards attribute drifted from decks[0] reads from the deck."""
+        node = etree.Element('games')
+        node.set('cards', json.dumps([{'term': 'stale', 'definition': 'stale', 'card_key': 'old'}]))
+        node.set('decks', json.dumps([
+            {'deck_key': 'deck-a', 'name': 'Deck A',
+             'cards': [{'term': 't', 'definition': 'd', 'card_key': 'ck'}]},
+        ]))
+        block = self._parse(node)
+
+        settings = CommonHandlers.get_settings(block, {})
+
+        assert settings['cards'] == block.decks[0]['cards']
+        assert settings['decks'][0]['cards'] == settings['cards']

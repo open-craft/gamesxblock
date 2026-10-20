@@ -108,6 +108,20 @@ class CommonHandlers:
         return str(uuid.uuid5(uuid.NAMESPACE_URL, f"games/deck-1/{block_id}"))
 
     @staticmethod
+    def primary_cards(decks):
+        """
+        Cards of the first deck, the primary deck older clients call ``cards``.
+
+        Always read from the deck list, so a stale or absent ``cards`` mirror
+        cannot change what clients see. A malformed stored value counts as none.
+        """
+        primary = decks[0] if decks else None
+        if not isinstance(primary, dict):
+            return []
+        cards = primary.get(DECK_FIELD.CARDS)
+        return list(cards) if isinstance(cards, list) else []
+
+    @staticmethod
     def get_decks(xblock):
         """
         Decks to hand to clients.
@@ -116,8 +130,8 @@ class CommonHandlers:
         presented as Deck 1. That is read-only; nothing is written until a save.
         """
         if xblock.decks:
-            # shortcut: cards is not resynced from decks here; XBlock exports
-            # always write both, upgrade if decks are ever written alone.
+            # Returned as stored; get_settings derives the cards mirror from the
+            # first deck, so a stale mirror never reaches a client.
             return xblock.decks
         return [
             {
@@ -130,11 +144,13 @@ class CommonHandlers:
 
     @staticmethod
     def get_settings(xblock, data, suffix=""):
-        """Get game type, decks, cards, and shuffle setting in one call."""
+        """Get game type, decks, the primary deck's cards, and settings in one call."""
+        decks = CommonHandlers.get_decks(xblock)
         return {
             "game_type": xblock.game_type,
-            "decks": CommonHandlers.get_decks(xblock),
-            "cards": xblock.cards or [],
+            "decks": decks,
+            # Compatibility view of the first deck, never a separate source of truth.
+            "cards": CommonHandlers.primary_cards(decks),
             "is_shuffled": xblock.is_shuffled,
             "has_timer": xblock.has_timer,
         }
@@ -244,14 +260,15 @@ class CommonHandlers:
         Canonicalize one deck's card list, raising ValueError on bad input.
 
         Applies the same rules the flat-card save has always applied: text
-        fields are coerced, a missing key is assigned, and only storage keys
-        this block created are kept.
+        fields are coerced, a missing key is assigned, only storage keys this
+        block created are kept, and ``order`` becomes the array index because
+        array position is authoritative.
         """
         if not isinstance(new_cards, list):
             raise ValueError(_("cards must be a list"))
 
         validated_cards = []
-        for card in new_cards:
+        for index, card in enumerate(new_cards):
             if not isinstance(card, dict):
                 raise ValueError(_("Each card must be an object"))
 
@@ -269,7 +286,7 @@ class CommonHandlers:
                     CARD_FIELD.TERM_IMAGE: CommonHandlers.text_field(card.get(CARD_FIELD.TERM_IMAGE)),
                     CARD_FIELD.DEFINITION: CommonHandlers.text_field(card.get(CARD_FIELD.DEFINITION)),
                     CARD_FIELD.DEFINITION_IMAGE: CommonHandlers.text_field(card.get(CARD_FIELD.DEFINITION_IMAGE)),
-                    CARD_FIELD.ORDER: card.get(CARD_FIELD.ORDER, ""),
+                    CARD_FIELD.ORDER: index,
                     CARD_FIELD.CARD_KEY: card_key,
                     CARD_FIELD.TERM_IMAGE_ALT: CommonHandlers.text_field(card.get(CARD_FIELD.TERM_IMAGE_ALT)),
                     CARD_FIELD.DEFINITION_IMAGE_ALT: CommonHandlers.text_field(
@@ -354,11 +371,14 @@ class CommonHandlers:
     @staticmethod
     def save_settings(xblock, data, suffix=""):
         """
-        Save game type, shuffle setting, and all decks in one API call.
+        Save game type, settings, and content in one API call.
 
-        A payload with a decks key replaces them all; decks wins when both decks
-        and cards are sent. A payload with only cards is the older client shape:
-        it updates Deck 1 and leaves every other deck untouched. Expected data
+        Omitted top-level fields keep their current value. A payload with a decks
+        key replaces the whole deck list, so omitted decks are deleted; decks wins
+        when both decks and cards are sent. A payload with only cards is the older
+        client shape: it updates the first deck and leaves every other deck
+        untouched. A payload with neither leaves authored content alone. Study
+        progress belongs to the browser and is never accepted here. Expected data
         format:
         {
             'display_name': 'Block title',
@@ -377,22 +397,28 @@ class CommonHandlers:
         }
         """
         try:
-            new_game_type = data.get("game_type", GAME_TYPE.FLASHCARDS)
+            new_game_type = data.get("game_type", xblock.game_type)
             if new_game_type not in GAME_TYPE.VALID:
                 return {"success": False, "error": _("Invalid game type")}
-            new_is_shuffled = data.get("is_shuffled", DEFAULT.IS_SHUFFLED)
-            new_has_timer = data.get("has_timer", DEFAULT.HAS_TIMER)
+            new_is_shuffled = data.get("is_shuffled", xblock.is_shuffled)
+            new_has_timer = data.get("has_timer", xblock.has_timer)
             if not isinstance(new_is_shuffled, bool) or not isinstance(new_has_timer, bool):
                 return {"success": False, "error": _("is_shuffled and has_timer must be booleans")}
-            display_name = CommonHandlers.text_field(data.get("display_name"), DEFAULT.DISPLAY_NAME)
+            display_name = CommonHandlers.text_field(data.get("display_name"), xblock.display_name)
 
+            new_decks = None
             if "decks" in data:
+                # The sent list is the complete deck list; omitted decks are deleted.
                 new_decks = CommonHandlers.validate_decks(xblock, data["decks"])
-            else:
-                new_cards = CommonHandlers.validate_cards(xblock, data.get("cards", []))
+            elif "cards" in data:
+                new_cards = CommonHandlers.validate_cards(xblock, data["cards"])
                 stored_decks = xblock.decks or []
                 if stored_decks:
-                    new_decks = [{**stored_decks[0], DECK_FIELD.CARDS: new_cards}] + list(stored_decks[1:])
+                    # Canonicalize the decks this save keeps, so an unvalidated card
+                    # without a card_key cannot break an older client's save.
+                    stored_decks = CommonHandlers.validate_decks(xblock, stored_decks)
+                    new_decks = [{**stored_decks[0], DECK_FIELD.CARDS: new_cards}]
+                    new_decks += stored_decks[1:]
                 else:
                     new_decks = [
                         {
@@ -402,28 +428,38 @@ class CommonHandlers:
                         }
                     ]
                 CommonHandlers.ensure_unique_card_keys(new_decks)
+            elif xblock.decks:
+                new_decks = list(xblock.decks)
 
-            xblock.decks = new_decks
-            xblock.cards = new_decks[0][DECK_FIELD.CARDS]
-            xblock.list_length = len(xblock.cards)
+            if new_decks:
+                xblock.decks = new_decks
+                # cards and list_length stay the compatibility view of the first deck.
+                xblock.cards = CommonHandlers.primary_cards(new_decks)
+                xblock.list_length = len(xblock.cards)
 
             xblock.display_name = display_name
-            if new_game_type == GAME_TYPE.FLASHCARDS:
-                xblock.title = DEFAULT.FLASHCARDS_TITLE
-            else:
-                xblock.title = DEFAULT.MATCHING_TITLE
+            if "game_type" in data:
+                xblock.title = (
+                    DEFAULT.FLASHCARDS_TITLE
+                    if new_game_type == GAME_TYPE.FLASHCARDS
+                    else DEFAULT.MATCHING_TITLE
+                )
             xblock.game_type = new_game_type
             xblock.is_shuffled = new_is_shuffled
             xblock.has_timer = new_has_timer
 
             xblock.save()
 
+            # Same shape as get_settings: a legacy cards-only block answers with
+            # its synthesized primary deck instead of an empty decks list.
+            response_decks = CommonHandlers.get_decks(xblock)
+            response_cards = CommonHandlers.primary_cards(response_decks)
             return {
                 "success": True,
                 "game_type": xblock.game_type,
-                "decks": xblock.decks,
-                "cards": xblock.cards,
-                "count": len(xblock.cards),
+                "decks": response_decks,
+                "cards": response_cards,
+                "count": len(response_cards),
                 "is_shuffled": xblock.is_shuffled,
                 "has_timer": xblock.has_timer,
             }
