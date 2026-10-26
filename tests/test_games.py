@@ -7,12 +7,14 @@ Following Open edX testing standards with pytest and ddt.
 import json
 from unittest.mock import Mock, patch
 import pytest
+from lxml import etree
 from xblock.field_data import DictFieldData
-from xblock.fields import Scope
+from xblock.fields import Scope, ScopeIds
 from xblock.test.tools import TestRuntime
 
 from games.games import GamesXBlock
 from games.constants import DEFAULT, GAME_TYPE
+from games.handlers.common import CommonHandlers
 
 
 @pytest.mark.django_db
@@ -233,6 +235,10 @@ class TestGamesXBlockFieldScopes:
         """Test that cards field has content scope."""
         assert self.block.fields['cards'].scope == Scope.content
 
+    def test_decks_is_content_scoped(self):
+        """Test that decks field has content scope."""
+        assert self.block.fields['decks'].scope == Scope.content
+
     def test_best_time_is_user_state_scoped(self):
         """Test that best_time field has user_state scope."""
         assert self.block.fields['best_time'].scope == Scope.user_state
@@ -248,3 +254,104 @@ class TestGamesXBlockFieldScopes:
     def test_has_timer_is_settings_scoped(self):
         """Test that has_timer field has settings scope."""
         assert self.block.fields['has_timer'].scope == Scope.settings
+
+
+@pytest.mark.django_db
+class TestGamesXBlockOlxRoundTrip:
+    """Decks must survive the standard XBlock OLX serialization."""
+
+    def setup_method(self):
+        """Set up a runtime that can construct blocks from XML."""
+        self.runtime = TestRuntime(services={'field-data': DictFieldData({})})
+        self.scope_ids = ScopeIds('test-user-id', 'games', 'test-def-id', Mock(block_id='olx-block-id'))
+
+    def _parse(self, node):
+        return GamesXBlock.parse_xml(node, self.runtime, self.scope_ids)
+
+    def _legacy_node(self):
+        """A block authored before decks existed: only a flat cards attribute."""
+        node = etree.Element('games')
+        node.set('cards', json.dumps([{'term': 't', 'definition': 'd', 'card_key': 'ck'}]))
+        return node
+
+    def test_legacy_olx_loads_as_deck_1_without_being_rewritten(self):
+        """Old OLX keeps working, and reading it does not invent a decks field."""
+        block = self._parse(self._legacy_node())
+
+        settings = CommonHandlers.get_settings(block, {})
+        assert settings['cards'] == [{'term': 't', 'definition': 'd', 'card_key': 'ck'}]
+        assert len(settings['decks']) == 1
+        assert settings['decks'][0]['name'] == 'Deck 1'
+        assert settings['decks'][0]['cards'] == block.cards
+        assert settings['decks'][0]['deck_key']
+        assert block.decks == []
+
+        node = etree.Element('games')
+        block.add_xml_to_node(node)
+        assert node.get('cards') is not None
+        assert node.get('decks') is None
+
+    def test_empty_cards_attribute_reads_as_empty_lists(self):
+        """OLX with cards="" parses as None; clients must still see lists."""
+        node = etree.Element('games')
+        node.set('cards', '')
+        block = self._parse(node)
+
+        settings = CommonHandlers.get_settings(block, {})
+        assert settings['cards'] == []
+        assert settings['decks'][0]['cards'] == []
+
+    def test_multi_deck_olx_round_trip_keeps_every_deck_and_key(self):
+        """An export must not drop decks, cards, keys or order."""
+        block = GamesXBlock(Mock(), DictFieldData({}), self.scope_ids)
+        result = CommonHandlers.save_settings(block, {
+            'game_type': GAME_TYPE.FLASHCARDS,
+            'decks': [
+                {'deck_key': 'deck-a', 'name': 'Deck A',
+                 'cards': [{'term': 'a1', 'definition': 'd1', 'card_key': 'c1'}]},
+                {'deck_key': 'deck-b', 'name': 'Deck B',
+                 'cards': [{'term': 'b1', 'definition': 'd2', 'card_key': 'c2'},
+                           {'term': 'b2', 'definition': 'd3', 'card_key': 'c3'}]},
+            ],
+        })
+        assert result['success'] is True
+
+        node = etree.Element('games')
+        block.add_xml_to_node(node)
+        imported = self._parse(node)
+
+        assert [deck['deck_key'] for deck in imported.decks] == ['deck-a', 'deck-b']
+        assert [deck['name'] for deck in imported.decks] == ['Deck A', 'Deck B']
+        assert [card['card_key'] for deck in imported.decks for card in deck['cards']] == ['c1', 'c2', 'c3']
+        assert imported.cards == imported.decks[0]['cards']
+        assert CommonHandlers.get_settings(imported, {})['decks'] == block.decks
+
+    def test_saving_a_legacy_olx_block_exports_its_materialized_deck_1(self):
+        """The deck key shown before the save is the one that gets stored."""
+        block = self._parse(self._legacy_node())
+        shown_key = CommonHandlers.get_settings(block, {})['decks'][0]['deck_key']
+
+        assert CommonHandlers.save_settings(block, {'cards': block.cards})['success'] is True
+
+        node = etree.Element('games')
+        block.add_xml_to_node(node)
+        imported = self._parse(node)
+
+        assert imported.decks[0]['deck_key'] == shown_key
+        assert imported.decks[0]['name'] == 'Deck 1'
+        assert imported.decks[0]['cards'] == imported.cards
+
+    def test_primary_deck_wins_over_a_stale_cards_mirror(self):
+        """A block whose cards attribute drifted from decks[0] reads from the deck."""
+        node = etree.Element('games')
+        node.set('cards', json.dumps([{'term': 'stale', 'definition': 'stale', 'card_key': 'old'}]))
+        node.set('decks', json.dumps([
+            {'deck_key': 'deck-a', 'name': 'Deck A',
+             'cards': [{'term': 't', 'definition': 'd', 'card_key': 'ck'}]},
+        ]))
+        block = self._parse(node)
+
+        settings = CommonHandlers.get_settings(block, {})
+
+        assert settings['cards'] == block.decks[0]['cards']
+        assert settings['decks'][0]['cards'] == settings['cards']

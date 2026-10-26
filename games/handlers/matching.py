@@ -14,6 +14,7 @@ from django.template import Context, Template
 from web_fragments.fragment import Fragment
 from ..constants import CONFIG, DEFAULT
 from ..utils import read_resource
+from .common import CommonHandlers
 
 
 class MatchingHandlers:
@@ -27,7 +28,9 @@ class MatchingHandlers:
     @staticmethod
     def student_view(xblock, context=None):
         """Render the student view for the matching game."""
-        cards = list(xblock.cards) if xblock.cards else []
+        # Same primary-deck derivation as get_settings, so Studio and learners
+        # never disagree when the cards mirror drifts from the decks.
+        cards = CommonHandlers.primary_cards(CommonHandlers.get_decks(xblock))
         list_length = len(cards)
         session_key = secrets.token_hex(32)
 

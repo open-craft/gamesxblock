@@ -1,11 +1,13 @@
 """
 Tests for common handlers.
 """
+import copy
 import json
 import hashlib
 from unittest.mock import Mock, patch, MagicMock
 from django.test import TestCase
 from faker import Faker
+from opaque_keys.edx.keys import UsageKey
 from xblock.field_data import DictFieldData
 from xblock.fields import ScopeIds
 
@@ -91,6 +93,53 @@ class TestCommonHandlers(TestCase):
         self.assertEqual(result['cards'], cards)
         self.assertEqual(result['is_shuffled'], is_shuffled)
         self.assertEqual(result['has_timer'], has_timer)
+
+    # Tests for decks
+    def test_get_settings_synthesizes_deck_1_for_a_legacy_block(self):
+        """A cards-only block must answer every client with the same one-deck shape."""
+        cards = [{'term': self.fake.word(), 'definition': self.fake.sentence(), 'card_key': self.fake.uuid4()}]
+        self.xblock.cards = cards
+
+        result = CommonHandlers.get_settings(self.xblock, {})
+
+        self.assertEqual(result['cards'], cards)
+        self.assertEqual(len(result['decks']), 1)
+        deck = result['decks'][0]
+        self.assertEqual(deck['name'], 'Deck 1')
+        self.assertEqual(deck['cards'], cards)
+        self.assertTrue(deck['deck_key'])
+
+    def test_synthesized_deck_key_is_stable_and_derived_from_the_usage_id(self):
+        """Reading a legacy block must not invent a new deck key, and it must not write."""
+        usage_id = UsageKey.from_string('block-v1:Org+Course+Run+type@games+block@deck-key-test')
+        block = GamesXBlock(self.runtime, DictFieldData({}), ScopeIds('user', 'games', 'def', usage_id))
+
+        first = CommonHandlers.get_settings(block, {})['decks'][0]['deck_key']
+        second = CommonHandlers.get_settings(block, {})['decks'][0]['deck_key']
+        self.assertEqual(first, second)
+        self.assertEqual(block.decks, [])
+
+        same_block = GamesXBlock(self.runtime, DictFieldData({}), ScopeIds('user', 'games', 'def', usage_id))
+        other_block = GamesXBlock(
+            self.runtime,
+            DictFieldData({}),
+            ScopeIds('user', 'games', 'def', UsageKey.from_string('block-v1:Org+Course+Run+type@games+block@other')),
+        )
+        self.assertEqual(CommonHandlers.get_settings(same_block, {})['decks'][0]['deck_key'], first)
+        self.assertNotEqual(CommonHandlers.get_settings(other_block, {})['decks'][0]['deck_key'], first)
+
+    def test_get_settings_returns_stored_decks(self):
+        """Once decks exist they are returned as stored."""
+        decks = [
+            {'deck_key': self.fake.uuid4(), 'name': 'Deck 1', 'cards': []},
+            {'deck_key': self.fake.uuid4(), 'name': 'Deck 2', 'cards': [{'term': 't', 'definition': 'd', 'card_key': 'k'}]},
+        ]
+        self.xblock.decks = decks
+
+        result = CommonHandlers.get_settings(self.xblock, {})
+
+        self.assertEqual(result['decks'], decks)
+        self.assertEqual(result['decks'][1]['name'], 'Deck 2')
 
     # Tests for upload_image
     @patch('games.handlers.common.get_gamesxblock_storage')
@@ -245,6 +294,438 @@ class TestCommonHandlers(TestCase):
 
         self.assertFalse(result['success'])
         self.assertIn('object', result['error'])
+
+    def test_save_settings_with_decks_stores_them_and_mirrors_deck_1(self):
+        """Decks are stored in order and the legacy cards field mirrors Deck 1."""
+        card_key = self.fake.uuid4()
+        deck_1_key = self.fake.uuid4()
+        deck_2_key = self.fake.uuid4()
+        payload = [
+            {'deck_key': deck_1_key, 'name': 'Deck 1', 'cards': [
+                {'term': 't1', 'definition': 'd1', 'card_key': card_key},
+                {'term': 't2', 'definition': 'd2'},
+            ]},
+            {'deck_key': deck_2_key, 'name': 'Deck 2', 'cards': []},
+        ]
+
+        result = CommonHandlers.save_settings(self.xblock, {'game_type': GAME_TYPE.FLASHCARDS, 'decks': payload})
+
+        self.assertTrue(result['success'])
+        self.assertEqual([deck['deck_key'] for deck in self.xblock.decks], [deck_1_key, deck_2_key])
+        self.assertEqual([deck['name'] for deck in self.xblock.decks], ['Deck 1', 'Deck 2'])
+        self.assertEqual(self.xblock.decks[0]['cards'][0]['card_key'], card_key)
+        self.assertEqual(self.xblock.cards, self.xblock.decks[0]['cards'])
+        self.assertEqual(self.xblock.list_length, 2)
+        self.assertEqual(result['decks'], self.xblock.decks)
+        self.assertEqual(result['cards'], self.xblock.cards)
+        self.assertEqual(result['count'], 2)
+
+    def test_save_settings_assigns_keys_and_trims_deck_names(self):
+        """A deck always ends up with a nonblank key and a trimmed name."""
+        result = CommonHandlers.save_settings(self.xblock, {
+            'game_type': GAME_TYPE.FLASHCARDS,
+            'decks': [
+                {'name': '  Deck A  ', 'cards': [{'term': 't', 'definition': 'd', 'card_key': ''}]},
+                {'deck_key': '', 'name': 'Deck B', 'cards': [{'term': 't', 'definition': 'd', 'card_key': 5}]},
+                {'deck_key': 7, 'name': 'Deck C', 'cards': [{'term': 't', 'definition': 'd', 'card_key': 'kept-key'}]},
+            ],
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual([deck['name'] for deck in self.xblock.decks], ['Deck A', 'Deck B', 'Deck C'])
+        deck_keys = [deck['deck_key'] for deck in self.xblock.decks]
+        self.assertEqual(len(set(deck_keys)), 3)
+        self.assertTrue(all(isinstance(key, str) and key for key in deck_keys))
+        card_keys = [deck['cards'][0]['card_key'] for deck in self.xblock.decks]
+        self.assertEqual(card_keys[2], 'kept-key')
+        self.assertTrue(all(card_key for card_key in card_keys))
+        self.assertEqual(len(set(card_keys)), 3)
+
+    def test_save_settings_cards_only_updates_deck_1_and_keeps_the_others(self):
+        """An older client must not lose decks it does not know about."""
+        stored = [
+            {'deck_key': 'deck-1-key', 'name': 'Deck 1', 'cards': [{'term': 'old', 'definition': 'x', 'card_key': 'c1'}]},
+            {'deck_key': 'deck-2-key', 'name': 'Deck 2', 'cards': [{'term': 'keep', 'definition': 'y', 'card_key': 'c2'}]},
+        ]
+        untouched = copy.deepcopy(stored)
+        self.xblock.decks = stored
+        self.xblock.cards = stored[0]['cards']
+
+        result = CommonHandlers.save_settings(self.xblock, {
+            'game_type': GAME_TYPE.FLASHCARDS,
+            'cards': [{'term': 'new', 'definition': 'z', 'card_key': 'c3'}],
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual(len(self.xblock.decks), 2)
+        self.assertEqual(self.xblock.decks[0]['deck_key'], 'deck-1-key')
+        self.assertEqual(self.xblock.decks[0]['name'], 'Deck 1')
+        self.assertEqual(self.xblock.decks[0]['cards'][0]['term'], 'new')
+        self.assertEqual(self.xblock.decks[0]['cards'][0]['card_key'], 'c3')
+        # The preserved deck keeps its key, name, cards and card keys; only its
+        # shape is canonicalized (filled card fields, order renumbered).
+        self.assertEqual(self.xblock.decks[1]['deck_key'], untouched[1]['deck_key'])
+        self.assertEqual(self.xblock.decks[1]['name'], untouched[1]['name'])
+        self.assertEqual(
+            [(card['term'], card['definition'], card['card_key']) for card in self.xblock.decks[1]['cards']],
+            [(card['term'], card['definition'], card['card_key']) for card in untouched[1]['cards']],
+        )
+        self.assertEqual(self.xblock.cards, self.xblock.decks[0]['cards'])
+        self.assertEqual(self.xblock.list_length, 1)
+        self.assertEqual(result['decks'], self.xblock.decks)
+
+    def test_save_settings_cards_only_rejects_duplicate_card_keys_within_deck_1(self):
+        """A flat cards save must not create duplicate card keys in Deck 1."""
+        self.xblock.decks = self._stored_decks()
+        self.xblock.cards = self.xblock.decks[0]['cards']
+        self.xblock.list_length = 1
+        stored = copy.deepcopy(self.xblock.decks)
+
+        result = CommonHandlers.save_settings(self.xblock, {
+            'game_type': GAME_TYPE.FLASHCARDS,
+            'cards': [
+                {'term': 'a', 'definition': 'b', 'card_key': 'same-key'},
+                {'term': 'c', 'definition': 'd', 'card_key': 'same-key'},
+            ],
+        })
+
+        self.assertFalse(result['success'])
+        self.assertIn('card_key', result['error'])
+        self.assertEqual(self.xblock.decks, stored)
+        self.assertEqual(self.xblock.cards, stored[0]['cards'])
+        self.assertEqual(self.xblock.list_length, 1)
+
+    def test_save_settings_cards_only_rejects_card_key_conflict_with_a_preserved_deck(self):
+        """A flat cards save must not duplicate a key already in Deck 2."""
+        stored = [
+            {'deck_key': 'deck-1-key', 'name': 'Deck 1', 'cards': []},
+            {'deck_key': 'deck-2-key', 'name': 'Deck 2', 'cards': [
+                {'term': 'keep', 'definition': 'y', 'card_key': 'shared-key'},
+            ]},
+        ]
+        self.xblock.decks = copy.deepcopy(stored)
+        self.xblock.cards = self.xblock.decks[0]['cards']
+        self.xblock.list_length = 0
+        before = copy.deepcopy(self.xblock.decks)
+
+        result = CommonHandlers.save_settings(self.xblock, {
+            'game_type': GAME_TYPE.FLASHCARDS,
+            'cards': [{'term': 'new', 'definition': 'z', 'card_key': 'shared-key'}],
+        })
+
+        self.assertFalse(result['success'])
+        self.assertIn('card_key', result['error'])
+        self.assertEqual(self.xblock.decks, before)
+        self.assertEqual(self.xblock.cards, before[0]['cards'])
+        self.assertEqual(self.xblock.list_length, 0)
+
+    def test_save_settings_cards_only_materializes_deck_1_for_a_legacy_block(self):
+        """The deck a legacy block was shown must be the deck it saves into."""
+        before = CommonHandlers.get_settings(self.xblock, {})['decks'][0]['deck_key']
+
+        result = CommonHandlers.save_settings(self.xblock, {
+            'game_type': GAME_TYPE.FLASHCARDS,
+            'cards': [{'term': 't', 'definition': 'd'}],
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual(len(self.xblock.decks), 1)
+        self.assertEqual(self.xblock.decks[0]['deck_key'], before)
+        self.assertEqual(self.xblock.decks[0]['name'], 'Deck 1')
+        self.assertEqual(self.xblock.decks[0]['cards'], self.xblock.cards)
+        self.assertEqual(self.xblock.list_length, 1)
+
+    def test_save_settings_prefers_decks_when_both_shapes_are_sent(self):
+        """The explicit deck list is authoritative; the flat cards are ignored."""
+        result = CommonHandlers.save_settings(self.xblock, {
+            'game_type': GAME_TYPE.FLASHCARDS,
+            'decks': [{'deck_key': 'd', 'name': 'Deck 1', 'cards': [{'term': 'from-decks', 'definition': 'd'}]}],
+            'cards': [{'term': 'from-cards', 'definition': 'd'}],
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual(len(self.xblock.decks), 1)
+        self.assertEqual(len(self.xblock.decks[0]['cards']), 1)
+        self.assertEqual(len(self.xblock.cards), 1)
+        self.assertEqual([card['term'] for card in self.xblock.cards], ['from-decks'])
+        self.assertEqual(self.xblock.cards, self.xblock.decks[0]['cards'])
+
+    def _stored_decks(self):
+        """Two stored decks, to prove failed saves leave them alone."""
+        return [
+            {'deck_key': 'deck-1-key', 'name': 'Deck 1', 'cards': [{'term': 'a', 'definition': 'b', 'card_key': 'c1'}]},
+            {'deck_key': 'deck-2-key', 'name': 'Deck 2', 'cards': []},
+        ]
+
+    def test_save_settings_rejects_empty_decks(self):
+        """A block must always keep at least one deck."""
+        self.xblock.decks = self._stored_decks()
+        self.xblock.cards = self.xblock.decks[0]['cards']
+
+        result = CommonHandlers.save_settings(self.xblock, {'decks': []})
+
+        self.assertFalse(result['success'])
+        self.assertEqual(self.xblock.decks, self._stored_decks())
+        self.assertEqual(self.xblock.cards, self._stored_decks()[0]['cards'])
+
+    def test_save_settings_rejects_blank_and_duplicate_deck_names(self):
+        """Names are required and unique ignoring case, whitespace included."""
+        self.xblock.decks = self._stored_decks()
+        bad_name_lists = [
+            [{'name': '   ', 'cards': []}],
+            [{'name': '', 'cards': []}],
+            [{'name': None, 'cards': []}],
+            [{'name': 'Deck A', 'cards': []}, {'name': '  deck a  ', 'cards': []}],
+        ]
+        for decks in bad_name_lists:
+            result = CommonHandlers.save_settings(self.xblock, {'decks': decks})
+            self.assertFalse(result['success'], decks)
+            self.assertEqual(self.xblock.decks, self._stored_decks(), decks)
+
+    def test_save_settings_rejects_duplicate_deck_and_card_keys(self):
+        """Keys identify decks and cards across the whole block."""
+        self.xblock.decks = self._stored_decks()
+        bad_decks = [
+            [
+                {'deck_key': 'same', 'name': 'Deck A', 'cards': []},
+                {'deck_key': 'same', 'name': 'Deck B', 'cards': []},
+            ],
+            [
+                {'name': 'Deck A', 'cards': [{'term': 't', 'definition': 'd', 'card_key': 'same'}]},
+                {'name': 'Deck B', 'cards': [{'term': 't', 'definition': 'd', 'card_key': 'same'}]},
+            ],
+            [
+                {'name': 'Deck A', 'cards': [
+                    {'term': 't', 'definition': 'd', 'card_key': 'same'},
+                    {'term': 't', 'definition': 'd', 'card_key': 'same'},
+                ]},
+            ],
+        ]
+        for decks in bad_decks:
+            result = CommonHandlers.save_settings(self.xblock, {'decks': decks})
+            self.assertFalse(result['success'], decks)
+            self.assertEqual(self.xblock.decks, self._stored_decks(), decks)
+
+    def test_save_settings_validates_every_deck_and_writes_nothing_on_failure(self):
+        """A bad card in the last deck must reject the whole payload."""
+        self.xblock.decks = self._stored_decks()
+        self.xblock.cards = self.xblock.decks[0]['cards']
+        self.xblock.list_length = 1
+
+        result = CommonHandlers.save_settings(self.xblock, {
+            'decks': [
+                {'name': 'Deck A', 'cards': [{'term': 'ok', 'definition': 'ok'}]},
+                {'name': 'Deck B', 'cards': [{'term': 'missing definition'}]},
+            ],
+        })
+
+        self.assertFalse(result['success'])
+        self.assertIn('term and definition', result['error'])
+        self.assertEqual(self.xblock.decks, self._stored_decks())
+        self.assertEqual(self.xblock.cards, self._stored_decks()[0]['cards'])
+        self.assertEqual(self.xblock.list_length, 1)
+
+    def test_save_settings_applies_image_path_rules_to_every_deck(self):
+        """Storage keys are only kept for this block, in any deck."""
+        own_path = f"games/{self.scope_ids.usage_id.block_id}/ok.png"
+
+        result = CommonHandlers.save_settings(self.xblock, {
+            'decks': [
+                {'name': 'Deck A', 'cards': []},
+                {'name': 'Deck B', 'cards': [
+                    {'term': 't', 'definition': 'd', 'term_image_path': own_path,
+                     'definition_image_path': 'games/other-block/x.png'},
+                ]},
+            ],
+        })
+
+        self.assertTrue(result['success'])
+        card = self.xblock.decks[1]['cards'][0]
+        self.assertEqual(card['term_image_path'], own_path)
+        self.assertEqual(card['definition_image_path'], '')
+
+    def test_save_settings_rejects_a_deck_whose_cards_are_not_a_list(self):
+        """Decks carry ordered card lists; anything else is a client bug."""
+        self.xblock.decks = self._stored_decks()
+
+        result = CommonHandlers.save_settings(self.xblock, {'decks': [{'name': 'Deck A', 'cards': 'nope'}]})
+
+        self.assertFalse(result['success'])
+        self.assertEqual(self.xblock.decks, self._stored_decks())
+
+    def test_save_settings_rejects_a_deck_without_a_cards_key(self):
+        """The frozen deck shape requires cards, even when the list is empty."""
+        self.xblock.decks = self._stored_decks()
+        self.xblock.cards = self.xblock.decks[0]['cards']
+        self.xblock.list_length = 1
+        before = copy.deepcopy(self.xblock.decks)
+
+        result = CommonHandlers.save_settings(self.xblock, {
+            'decks': [{'deck_key': 'deck-1-key', 'name': 'Deck 1'}],
+        })
+
+        self.assertFalse(result['success'])
+        self.assertIn('cards', result['error'])
+        self.assertEqual(self.xblock.decks, before)
+        self.assertEqual(self.xblock.cards, before[0]['cards'])
+        self.assertEqual(self.xblock.list_length, 1)
+
+    def test_get_settings_cards_follows_the_primary_deck(self):
+        """A stale cards mirror must not change what a client sees."""
+        self.xblock.decks = [
+            {'deck_key': 'deck-1-key', 'name': 'Deck 1', 'cards': [{'term': 't', 'definition': 'd', 'card_key': 'k1'}]},
+        ]
+        self.xblock.cards = [{'term': 'stale', 'definition': 'stale', 'card_key': 'old-key'}]
+
+        result = CommonHandlers.get_settings(self.xblock, {})
+
+        self.assertEqual(result['cards'], self.xblock.decks[0]['cards'])
+        self.assertEqual(result['decks'][0]['cards'], result['cards'])
+
+    def test_malformed_primary_cards_read_as_empty(self):
+        """A non-list stored cards value must not become a list of characters."""
+        self.xblock.decks = [{'deck_key': 'deck-1-key', 'name': 'Deck 1', 'cards': 'abc'}]
+
+        self.assertEqual(CommonHandlers.get_settings(self.xblock, {})['cards'], [])
+
+        CommonHandlers.save_settings(self.xblock, {'is_shuffled': False})
+
+        self.assertEqual(self.xblock.cards, [])
+        self.assertEqual(self.xblock.list_length, 0)
+
+    def test_save_settings_omitted_fields_keep_their_current_values(self):
+        """A decks-only save must not flip the game type or rename the block."""
+        self.xblock.game_type = GAME_TYPE.MATCHING
+        self.xblock.title = 'Custom title'
+        self.xblock.display_name = 'My matching game'
+        self.xblock.is_shuffled = False
+        self.xblock.has_timer = False
+
+        result = CommonHandlers.save_settings(self.xblock, {'decks': [{'name': 'Deck 1', 'cards': []}]})
+
+        self.assertTrue(result['success'])
+        self.assertEqual(self.xblock.game_type, GAME_TYPE.MATCHING)
+        self.assertEqual(self.xblock.display_name, 'My matching game')
+        self.assertEqual(self.xblock.title, 'Custom title')
+        self.assertFalse(self.xblock.is_shuffled)
+        self.assertFalse(self.xblock.has_timer)
+
+    def test_save_settings_null_or_non_string_display_name_keeps_the_current_name(self):
+        """The editor types display_name as string | null; only a string renames."""
+        self.xblock.display_name = 'Kept name'
+
+        for bad_name in (None, 7, ['n']):
+            result = CommonHandlers.save_settings(self.xblock, {'display_name': bad_name, 'cards': []})
+            self.assertTrue(result['success'], bad_name)
+            self.assertEqual(self.xblock.display_name, 'Kept name', bad_name)
+
+    def test_save_settings_without_content_preserves_authored_content(self):
+        """A settings-only save must not wipe cards or invent a deck."""
+        authored = [{'term': 't', 'definition': 'd', 'card_key': 'k'}]
+        self.xblock.cards = authored
+
+        result = CommonHandlers.save_settings(self.xblock, {'is_shuffled': False})
+
+        self.assertTrue(result['success'])
+        self.assertEqual(self.xblock.cards, authored)
+        self.assertEqual(self.xblock.decks, [])
+        # The response answers in get_settings shape: one synthesized primary deck.
+        self.assertEqual(len(result['decks']), 1)
+        self.assertEqual(result['decks'][0]['name'], 'Deck 1')
+        self.assertEqual(result['decks'][0]['cards'], authored)
+        self.assertTrue(result['decks'][0]['deck_key'])
+        self.assertEqual(result['cards'], authored)
+        self.assertEqual(result['count'], 1)
+
+    def test_save_settings_without_content_syncs_the_mirror_to_the_primary_deck(self):
+        """A settings-only save repairs a stale cards mirror and list_length."""
+        self.xblock.decks = [
+            {
+                'deck_key': 'deck-1-key',
+                'name': 'Deck 1',
+                'cards': [
+                    {'term': 'a', 'definition': 'b', 'card_key': 'k1'},
+                    {'term': 'c', 'definition': 'd', 'card_key': 'k2'},
+                ],
+            },
+        ]
+        self.xblock.cards = []
+        self.xblock.list_length = 0
+
+        result = CommonHandlers.save_settings(self.xblock, {'is_shuffled': False})
+
+        self.assertTrue(result['success'])
+        self.assertEqual(self.xblock.cards, self.xblock.decks[0]['cards'])
+        self.assertEqual(self.xblock.list_length, 2)
+
+    def test_save_settings_decks_replaces_the_stored_list(self):
+        """The sent decks list is complete: omitted decks are deleted."""
+        self.xblock.decks = self._stored_decks()
+        self.xblock.cards = self.xblock.decks[0]['cards']
+        self.xblock.list_length = 1
+
+        result = CommonHandlers.save_settings(self.xblock, {
+            'decks': [{'deck_key': 'deck-1-key', 'name': 'Deck 1', 'cards': []}],
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual([deck['deck_key'] for deck in self.xblock.decks], ['deck-1-key'])
+        self.assertEqual(self.xblock.cards, [])
+        self.assertEqual(self.xblock.list_length, 0)
+
+    def test_save_settings_canonicalizes_card_order_to_the_array_index(self):
+        """Array position is authoritative, so a stale order is renumbered."""
+        result = CommonHandlers.save_settings(self.xblock, {
+            'decks': [
+                {'name': 'Deck 1', 'cards': [
+                    {'term': 'b', 'definition': 'd', 'order': 7},
+                    {'term': 'a', 'definition': 'd'},
+                ]},
+                {'name': 'Deck 2', 'cards': [{'term': 'c', 'definition': 'd', 'order': '0'}]},
+            ],
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual([card['order'] for card in self.xblock.decks[0]['cards']], [0, 1])
+        self.assertEqual([card['order'] for card in self.xblock.decks[1]['cards']], [0])
+        self.assertEqual([card['term'] for card in self.xblock.cards], ['b', 'a'])
+
+    def test_save_settings_cards_only_canonicalizes_a_preserved_deck(self):
+        """Preserved decks get card keys and the array index as order."""
+        self.xblock.decks = [
+            {'deck_key': 'deck-1-key', 'name': 'Deck 1', 'cards': []},
+            {'deck_key': 'deck-2-key', 'name': 'Deck 2', 'cards': [
+                {'term': 'keep', 'definition': 'y', 'order': 9},
+                {'term': 'also', 'definition': 'y', 'card_key': 'k2'},
+            ]},
+        ]
+        self.xblock.cards = []
+
+        result = CommonHandlers.save_settings(self.xblock, {'cards': [{'term': 'new', 'definition': 'z'}]})
+
+        self.assertTrue(result['success'])
+        preserved_cards = self.xblock.decks[1]['cards']
+        self.assertEqual([card['term'] for card in preserved_cards], ['keep', 'also'])
+        self.assertEqual([card['order'] for card in preserved_cards], [0, 1])
+        self.assertTrue(preserved_cards[0]['card_key'])
+        self.assertEqual(preserved_cards[1]['card_key'], 'k2')
+        self.assertEqual([card['term'] for card in self.xblock.cards], ['new'])
+
+    def test_save_settings_cards_only_rejects_an_invalid_preserved_deck(self):
+        """A preserved deck that is itself invalid rejects the legacy save."""
+        stored = [
+            {'deck_key': 'deck-1-key', 'name': 'Deck 1', 'cards': []},
+            {'deck_key': 'deck-2-key', 'name': 'Deck 2'},
+        ]
+        self.xblock.decks = copy.deepcopy(stored)
+        self.xblock.cards = []
+
+        result = CommonHandlers.save_settings(self.xblock, {'cards': [{'term': 'new', 'definition': 'z'}]})
+
+        self.assertFalse(result['success'])
+        self.assertIn('cards', result['error'])
+        self.assertEqual(self.xblock.decks, stored)
+        self.assertEqual(self.xblock.cards, [])
 
     # Tests for format_as_uuid_like
     def test_format_as_uuid_like(self):
